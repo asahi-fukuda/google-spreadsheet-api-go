@@ -70,6 +70,120 @@ func saveToken(path string, token *oauth2.Token) {
 	json.NewEncoder(f).Encode(token)
 }
 
+// スプレッドシートの新規作成
+func createSpreadsheet(srv *sheets.Service) (*sheets.Spreadsheet, error) {
+	spreadsheet := &sheets.Spreadsheet{
+		Properties: &sheets.SpreadsheetProperties{
+			Title: "勤務表作成テスト",
+		},
+	}
+
+	newSheet, err := srv.Spreadsheets.Create(spreadsheet).Do()
+	if err != nil {
+		return nil, err
+	}
+
+	return newSheet, nil
+}
+
+// スプレッドシートをシートIDから取得
+func getSpreadsheet(srv *sheets.Service, spreadsheetId string) (*sheets.Spreadsheet, error) {
+	spreadsheet, err := srv.Spreadsheets.Get(spreadsheetId).Do()
+	if err != nil {
+		return nil, err
+	}
+
+	return spreadsheet, nil
+}
+
+// IDで指定したスプレッドシートをコピー
+func copySpreadsheet(ctx context.Context, sourceSpreadsheet *sheets.Spreadsheet, srv *sheets.Service, sourceSpreadsheetId string, destinationSpreadsheetId string) error {
+	for _, sheet := range sourceSpreadsheet.Sheets {
+		rb := &sheets.CopySheetToAnotherSpreadsheetRequest{
+			DestinationSpreadsheetId: destinationSpreadsheetId,
+		}
+
+		resp, err := srv.Spreadsheets.Sheets.CopyTo(sourceSpreadsheetId, sheet.Properties.SheetId, rb).Context(ctx).Do()
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		newSheetTitle := strings.TrimSuffix(resp.Title, "のコピー")
+
+		updateSheetNameRequest := sheets.Request{
+			UpdateSheetProperties: &sheets.UpdateSheetPropertiesRequest{
+				Properties: &sheets.SheetProperties{
+					SheetId: resp.SheetId,
+					Title:   newSheetTitle,
+				},
+				Fields: "title",
+			},
+		}
+
+		batchUpdateRequest := &sheets.BatchUpdateSpreadsheetRequest{
+			Requests: []*sheets.Request{&updateSheetNameRequest},
+		}
+
+		_, err = srv.Spreadsheets.BatchUpdate(destinationSpreadsheetId, batchUpdateRequest).Context(ctx).Do()
+		if err != nil {
+			log.Fatalf("Unable to update sheet name: %v", err)
+		}
+	}
+
+	return nil
+}
+
+// 空白のスプレッドシートを削除
+func deleteBlankSheet(ctx context.Context, srv *sheets.Service, newSheet *sheets.Spreadsheet, destinationSpreadsheetId string) error {
+	blankSheetId := newSheet.Sheets[0].Properties.SheetId
+
+	deleteSheetRequest := sheets.Request{
+		DeleteSheet: &sheets.DeleteSheetRequest{
+			SheetId: blankSheetId,
+		},
+	}
+
+	batchUpdateRequest := &sheets.BatchUpdateSpreadsheetRequest{
+		Requests: []*sheets.Request{&deleteSheetRequest},
+	}
+
+	_, err := srv.Spreadsheets.BatchUpdate(destinationSpreadsheetId, batchUpdateRequest).Context(ctx).Do()
+	if err != nil {
+		log.Fatalf("Unable to delete sheet: %v", err)
+	}
+
+	return nil
+}
+
+// セルA1とA3に年と月を入力
+func updateCellsYearMonth(ctx context.Context, srv *sheets.Service, destinationSpreadsheet *sheets.Spreadsheet, destinationSpreadsheetId string) error {
+	now := time.Now()
+	year := now.Year()
+	month := int(now.Month())
+
+	for _, sheet := range destinationSpreadsheet.Sheets {
+		sheetName := sheet.Properties.Title
+		values := [][]interface{}{
+			{year},
+			{},
+			{month},
+		}
+
+		updateValuesRequest := &sheets.ValueRange{
+			Range:          sheetName + "!A1:A3",
+			Values:         values,
+			MajorDimension: "ROWS",
+		}
+
+		_, err := srv.Spreadsheets.Values.Update(destinationSpreadsheetId, updateValuesRequest.Range, updateValuesRequest).ValueInputOption("RAW").Context(ctx).Do()
+		if err != nil {
+			log.Fatalf("Unable to update cells with year and month: %v", err)
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	ctx := context.Background()
 	b, err := os.ReadFile("credentials.json")
@@ -88,114 +202,41 @@ func main() {
 		log.Fatalf("Unable to NewService: %v", err)
 	}
 
-	// 新規スプレッドシートを作成
-	spreadsheet := &sheets.Spreadsheet{
-		Properties: &sheets.SpreadsheetProperties{
-			Title: "勤務表作成テスト",
-		},
-	}
-
-	newSheet, err := srv.Spreadsheets.Create(spreadsheet).Do()
+	newSheet, err := createSpreadsheet(srv)
 	if err != nil {
-		log.Fatalf("Unable to Create: %v", err)
+		log.Fatalf("Unable to createSpreadsheet: %v", err)
 	}
 
 	// コピー元のID
 	sourceSpreadsheetId := ""
 
-	// コピー先のID
+	// コピー先のID（作成したID）
 	destinationSpreadsheetId := newSheet.SpreadsheetId
 
-	// コピー元のスプレッドシートを取得
-	sourceSpreadsheet, err := srv.Spreadsheets.Get(sourceSpreadsheetId).Do()
+	sourceSpreadsheet, err := getSpreadsheet(srv, sourceSpreadsheetId)
 	if err != nil {
 		log.Fatalf("Unable to Get source spreadsheet: %v", err)
 	}
 
-	// コピー元のすべてのシートをコピー先にコピー
-	for _, sheet := range sourceSpreadsheet.Sheets {
-		rb := &sheets.CopySheetToAnotherSpreadsheetRequest{
-			DestinationSpreadsheetId: destinationSpreadsheetId,
-		}
-
-		resp, err := srv.Spreadsheets.Sheets.CopyTo(sourceSpreadsheetId, sheet.Properties.SheetId, rb).Context(ctx).Do()
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		// コピー後のシート名から「のコピー」を削除
-		newSheetTitle := strings.TrimSuffix(resp.Title, "のコピー")
-
-		updateSheetNameRequest := sheets.Request{
-			UpdateSheetProperties: &sheets.UpdateSheetPropertiesRequest{
-				Properties: &sheets.SheetProperties{
-					SheetId: resp.SheetId,
-					Title:   newSheetTitle,
-				},
-				Fields: "title",
-			},
-		}
-
-		batchUpdateRequest := &sheets.BatchUpdateSpreadsheetRequest{
-			Requests: []*sheets.Request{&updateSheetNameRequest},
-		}
-
-		// シート名を更新
-		_, err = srv.Spreadsheets.BatchUpdate(destinationSpreadsheetId, batchUpdateRequest).Context(ctx).Do()
-		if err != nil {
-			log.Fatalf("Unable to update sheet name: %v", err)
-		}
+	err = copySpreadsheet(ctx, sourceSpreadsheet, srv, sourceSpreadsheetId, destinationSpreadsheetId)
+	if err != nil {
+		log.Fatalf("Unable to copySpreadsheet: %v", err)
 	}
 
-	// 空白のスプレッドシートのID
-	blankSheetId := newSheet.Sheets[0].Properties.SheetId
-
-	// 空白シートの削除
 	if len(sourceSpreadsheet.Sheets) > 0 {
-		deleteSheetRequest := sheets.Request{
-			DeleteSheet: &sheets.DeleteSheetRequest{
-				SheetId: blankSheetId,
-			},
-		}
-
-		batchUpdateRequest := &sheets.BatchUpdateSpreadsheetRequest{
-			Requests: []*sheets.Request{&deleteSheetRequest},
-		}
-
-		_, err = srv.Spreadsheets.BatchUpdate(destinationSpreadsheetId, batchUpdateRequest).Context(ctx).Do()
+		err = deleteBlankSheet(ctx, srv, newSheet, destinationSpreadsheetId)
 		if err != nil {
 			log.Fatalf("Unable to delete blank sheet: %v", err)
 		}
 	}
 
-	// コピーしたシートを取得
-	s, err := srv.Spreadsheets.Get(destinationSpreadsheetId).Do()
+	destinationSpreadsheet, err := getSpreadsheet(srv, destinationSpreadsheetId)
 	if err != nil {
 		log.Fatalf("Unable to retrieve sheets: %v", err)
 	}
 
-	now := time.Now()
-	year := now.Year()
-	month := int(now.Month())
-
-	// 今年と今月の数値をA1とA3に書き込む
-	for _, sheet := range s.Sheets {
-		sheetName := sheet.Properties.Title
-		values := [][]interface{}{
-			{year},
-			{},
-			{month},
-		}
-
-		updateValuesRequest := &sheets.ValueRange{
-			Range:          sheetName + "!A1:A3",
-			Values:         values,
-			MajorDimension: "ROWS",
-		}
-
-		_, err := srv.Spreadsheets.Values.Update(destinationSpreadsheetId, updateValuesRequest.Range, updateValuesRequest).ValueInputOption("RAW").Context(ctx).Do()
-		if err != nil {
-			log.Fatalf("Unable to update cells with year and month: %v", err)
-		}
+	err = updateCellsYearMonth(ctx, srv, destinationSpreadsheet, destinationSpreadsheetId)
+	if err != nil {
+		log.Fatalf("Unable to update cells with year and month: %v", err)
 	}
 }
